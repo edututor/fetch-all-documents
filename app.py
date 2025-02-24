@@ -1,36 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from loguru import logger
+from config import settings
 import boto3
 import os
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('app.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore"
-    )
-    aws_access_key: str
-    aws_secret_key: str
-    bucket_name: str
-
-    def __init__(self, **data):
-        super().__init__(**data)
-
-settings = Settings()
 
 app = FastAPI()
 app.add_middleware(
@@ -48,40 +22,44 @@ s3_client = boto3.client(
     aws_secret_access_key=settings.aws_secret_key
 )
 
-def calculate_total_pages(total_items: int, page_size: int) -> int:
-    return -(-total_items // page_size)  # Ceiling division
-
-def get_start_key(page: int, page_size: int) -> int:
-    return (page - 1) * page_size
-
 @app.get("/api/documents")
-async def fetch_all_documents(page: int = 1, page_size: int = 20):
+async def fetch_all_documents():
     try:
-        logger.info("Fetching documents from S3")
-
-        response = s3_client.list_objects_v2(
-            Bucket=settings.bucket_name,
-            MaxKeys=page_size,
-            StartAfter='' if page == 1 else get_start_key(page, page_size)
-        )
-
+        logger.info("Fetching all documents from S3")
         documents = []
-        if 'Contents' in response:
-            documents = [obj['Key'] for obj in response['Contents']]
+        continuation_token = None
+
+        # Loop until all objects have been fetched
+        while True:
+            if continuation_token:
+                response = s3_client.list_objects_v2(
+                    Bucket=settings.bucket_name,
+                    ContinuationToken=continuation_token
+                )
+            else:
+                response = s3_client.list_objects_v2(
+                    Bucket=settings.bucket_name
+                )
+            
+            if 'Contents' in response:
+                documents.extend([obj['Key'] for obj in response['Contents']])
+            
+            if response.get('IsTruncated'):  # There are more objects to fetch
+                continuation_token = response.get('NextContinuationToken')
+            else:
+                break
+
         logger.info(f"Successfully fetched {len(documents)} documents")
-        
         return JSONResponse(
             status_code=200,
             content={
-                "list_of_names": documents,
-                "has_more": response.get('IsTruncated', False),
-                "total_pages": calculate_total_pages(response.get('KeyCount', 0), page_size),
-                "current_page": page
+                "list_of_names": documents
             }
         )
     except Exception as e:
         logger.error(f"Error fetching documents: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
